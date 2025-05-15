@@ -1,0 +1,246 @@
+#include <U8g2lib.h>
+
+//------------------
+// Configuración de pines
+//------------------
+#define rst U8X8_PIN_NONE
+#define sda 14    // D6
+#define scl 12    // D5
+#define out A0    // Entrada ECG
+#define LoP 4     // D2 Lo+
+#define LoM 0     // D3 Lo-
+
+//------------------
+// Configuración de la pantalla OLED
+//------------------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, rst, scl, sda);
+
+//------------------
+// Estados y temporización
+//------------------
+enum Estado { loading, cali, working, fun };
+Estado estado = loading;
+unsigned long start;
+unsigned long current;
+unsigned long limit = 5000;
+int progress = 0;
+
+//------------------
+// Variables de calibración
+//------------------
+#define NUM_LECTURAS 100
+float suma = 0;
+float CORRECCION = 1.0;  
+int lectura = 0;
+float lecturaCorregida = 0;
+
+//------------------
+// Variables para señales ECG y BPM
+//------------------
+int P = 0, Q = 0, R = 0, S = 0, T = 0;
+int bpm = 0;
+unsigned long lastBeat = 0;
+
+//------------------
+// Buffer deslizante para la gráfica
+//------------------
+#define ECG_BUFFER_SIZE 81
+float ecgData[ECG_BUFFER_SIZE] = {0};
+int ecg_index = 0;
+
+//------------------
+// Configuración del área del gráfico
+//------------------
+int ex1 = 45, ey1 = 0;
+int ex3 = 126, ey3 = 47;
+int GraphWidth = ex3 - ex1;  // 81 píxeles
+int GraphHeight = ey3 - ey1;
+float scaY_o = 10;  // ajusta altura 
+int offsetY = 15;   // ajusta amplitud al parecer
+
+//------------------
+// Coordenadas para mostrar los valores de las ondas
+//------------------
+int coordP_x = 0,  coordP_y = 10;
+int coordQ_x = 0,  coordQ_y = 20;
+int coordR_x = 0,  coordR_y = 30;
+int coordS_x = 0,  coordS_y = 40;
+int coordT_x = 0,  coordT_y = 60;
+int coordBPM_x = 50, coordBPM_y = 60;
+
+//------------------
+// Funciones
+//------------------
+void LoadScreen() {
+  current = millis();
+  progress = map(current - start, 0, limit, 0, 100);
+  if (progress > 120)
+    progress = 120;
+  
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(20, 20, "ECG Portatil");
+  u8g2.drawFrame(10, 40, 108, 10);
+  u8g2.drawBox(10, 40, progress, 10);
+  u8g2.sendBuffer();
+  
+  if (current - start >= limit)
+    estado = cali;
+}
+
+void calibrarECG() {
+  static int i = 0;
+  if (i < NUM_LECTURAS) {
+    lectura = analogRead(out);
+    lecturaCorregida = (lectura * 5.0) / 1023.0 * CORRECCION;
+    suma += lecturaCorregida;
+    
+    int progresoBarra = map(i, 0, NUM_LECTURAS, 0, 100);
+    int largoBarra = map(progresoBarra, 0, 100, 0, 120);
+    
+    u8g2.clearBuffer();
+    u8g2.drawStr(0, 10, "Calibrando...");
+    u8g2.drawFrame(0, 20, 120, 10);
+    u8g2.drawBox(0, 20, largoBarra, 10);
+    u8g2.sendBuffer();
+    
+    i++;
+  } else {
+    CORRECCION = suma / NUM_LECTURAS;
+    estado = working;
+    suma = 0;
+    i = 0;
+  }
+}
+
+float ecgRead() {
+  int ecgRaw = analogRead(out);
+  return (ecgRaw / 1024.0) * 3.3;
+}
+
+void detectarOndas(float valor) {
+  static bool BoolR = false;
+  static bool BoolS = false;
+  
+  // Definir un período refractario de 250 ms
+  const unsigned long refractory = 250;  
+  unsigned long t_actual = millis();
+  
+  // Detecta la onda R solo si ha pasado el período refractario
+  if (!BoolR && valor > 2.0 && (t_actual - lastBeat > refractory)) {
+    R = valor * 20;
+    unsigned long diff = t_actual - lastBeat;
+    if (diff > 0)
+      bpm = 60000 / diff;  // bpm calculado a partir de diff en ms
+    lastBeat = t_actual;
+    BoolR = true;
+  }
+  else if (BoolR && valor < 2.0) {
+    BoolR = false;
+  }
+  
+  // Detección de la onda S (umbral y lógica pueden ajustarse si es necesario)
+  if (!BoolS && valor < 1.0) {
+    S = valor * 20;
+    BoolS = true;
+  }
+  else if (BoolS && valor > 1.0) {
+    BoolS = false;
+  }
+  
+  // Detección de la onda P (ajusta el umbral según la señal)
+  if (valor < 0.5) {
+    P = valor * 20;
+  }
+  
+  // Cálculos aproximados para Q y T
+  Q = (R + S) / 2;
+  T = (P + S) / 2;
+}
+
+
+void updateECGData(float valor) {
+  ecgData[ecg_index] = valor;
+  ecg_index = (ecg_index + 1) % ECG_BUFFER_SIZE;
+}
+
+void Graph() {
+  // Dibujar el marco del gráfico
+  u8g2.drawFrame(ex1, ey1, GraphWidth, GraphHeight);
+  
+  int x = ex1;
+  int y_prev = ey1 + (GraphHeight / 2) + offsetY - int(ecgData[ecg_index] * scaY_o);
+  y_prev = constrain(y_prev, ey1 + 2, ey1 + GraphHeight - 2);
+  
+  for (int i = 1; i < ECG_BUFFER_SIZE; i++) {
+    int index = (ecg_index + i) % ECG_BUFFER_SIZE;
+    int y = ey1 + (GraphHeight / 2) + offsetY - int(ecgData[index] * scaY_o);
+    y = constrain(y, ey1 + 2, ey1 + GraphHeight - 2);
+    u8g2.drawLine(x + i - 1, y_prev, x + i, y);
+    y_prev = y;
+  }
+}
+
+void Ondas() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  
+  u8g2.setCursor(coordP_x, coordP_y);
+  u8g2.print("P: ");
+  u8g2.print(P);
+  u8g2.setCursor(coordQ_x, coordQ_y);
+  u8g2.print("Q: ");
+  u8g2.print(Q);
+  u8g2.setCursor(coordR_x, coordR_y);
+  u8g2.print("R: ");
+  u8g2.print(R);
+  u8g2.setCursor(coordS_x, coordS_y);
+  u8g2.print("S: ");
+  u8g2.print(S);
+  u8g2.setCursor(coordT_x, coordT_y);
+  u8g2.print("T: ");
+  u8g2.print(T);
+  u8g2.setCursor(coordBPM_x, coordBPM_y);
+  u8g2.print("BPM: ");
+  u8g2.print(bpm);
+  
+  Graph();
+  u8g2.sendBuffer();
+}
+
+void Uix() {
+  Ondas();
+}
+
+void loopECG() {
+  float valor = ecgRead();
+  detectarOndas(valor);
+  updateECGData(valor);
+  Uix();
+}
+
+void setup() {
+  Serial.begin(115200);
+  u8g2.begin();
+  
+  start = millis();
+  pinMode(LoP, INPUT);
+  pinMode(LoM, INPUT);
+}
+
+void loop() {
+  switch (estado) {
+    case loading:
+      LoadScreen();
+      break;
+    case cali:
+      calibrarECG();
+      break;
+    case working:
+      loopECG();
+      break;
+    case fun:
+      // Implementar si es necesario
+      break;
+  }
+}
